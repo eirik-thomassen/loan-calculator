@@ -1,6 +1,9 @@
+import copy
+
 import numpy as np
 from config import MAX_DEPOSIT, MAX_LOAN_PER_BORROWER
 from config import DIVIDEND_RATE, DEDUCTION_RATE
+from config import LOWER_QUANTILE_RATE, UPPER_QUANTILE_RATE
 
 
 class Apartment:
@@ -120,7 +123,14 @@ class LoanBorrower:
 
 
 class CustomerDividend:
-    def __init__(self, deposit, borrowers) -> None:
+    def __init__(
+        self,
+        deposit,
+        borrowers,
+        dividend_rate=DIVIDEND_RATE,
+        max_loan_per_borrower=MAX_LOAN_PER_BORROWER,
+        max_deposit=MAX_DEPOSIT,
+    ) -> None:
         """Initialize a CustomerDividend object.
 
         Parameters
@@ -129,9 +139,20 @@ class CustomerDividend:
             Amount deposited during the previous calendar year in NOK.
         borrowers : int
             Number of borrowers associated with a loan.
+        dividend_rate : float, optional
+            Annual dividend rate expressed as a decimal. Defaults to
+            DIVIDEND_RATE in config.py.
+        max_loan_per_borrower : float, optional
+            Loan limit per borrower in NOK. Defaults to
+            MAX_LOAN_PER_BORROWER in config.py.
+        max_deposit : float, optional
+            Deposit limit in NOK. Defaults to MAX_DEPOSIT in config.py.
         """
         self.deposit = deposit
         self.borrowers = borrowers
+        self.dividend_rate = dividend_rate
+        self.max_loan_per_borrower = max_loan_per_borrower
+        self.max_deposit = max_deposit
 
     def get_dividend(self, loan_balance_schedule) -> np.ndarray:
         """Calculate the projected dividend rate over the payment schedule.
@@ -163,17 +184,25 @@ class CustomerDividend:
 
         borrowers = min(self.borrowers, 2)
 
-        loan_limit = MAX_LOAN_PER_BORROWER * borrowers
-        deposit_limit = MAX_DEPOSIT
+        loan_limit = self.max_loan_per_borrower * borrowers
+        deposit_limit = self.max_deposit
 
         eligible_loan = np.minimum(loan_balance_schedule, loan_limit)
         eligible_deposit = min(self.deposit, deposit_limit)
 
-        return (eligible_loan + eligible_deposit) * DIVIDEND_RATE
+        return (eligible_loan + eligible_deposit) * self.dividend_rate
 
 
 class MonthlyCost:
-    def __init__(self, loan, apartment, customer_dividend):
+    def __init__(
+        self,
+        loan,
+        apartment,
+        customer_dividend,
+        deduction_rate=DEDUCTION_RATE,
+        include_dividend=True,
+        include_deduction=True,
+    ):
         """Initialize a MonthlyCost object.
 
         Parameters
@@ -185,10 +214,20 @@ class MonthlyCost:
         customer_dividend : CustomerDividend
             CustomerDividend object used to calculate dividend returns
             in NOK.
+        deduction_rate : float, optional
+            Tax deduction rate expressed as a decimal. Defaults to
+            DEDUCTION_RATE in config.py.
+        include_dividend : bool, optional
+            Subtract the customer dividend from the monthly cost.
+        include_deduction : bool, optional
+            Subtract the tax deduction from the monthly cost.
         """
         self.loan = loan
         self.apartment = apartment
         self.customer_dividend = customer_dividend
+        self.deduction_rate = deduction_rate
+        self.include_dividend = include_dividend
+        self.include_deduction = include_deduction
 
     def _get_outstanding_balance_schedule(self) -> np.ndarray:
         """Calculate the projected outstanding balance schedule.
@@ -196,8 +235,9 @@ class MonthlyCost:
         Returns
         -------
         np.ndarray
-            Outstanding loan balance for each month in the payment 
-            schedule in NOK.
+            Outstanding loan balance for each month in the payment
+            schedule in NOK. Month 0 is the opening balance and month k
+            is the balance after the k-th payment.
         """
         annuity = self.loan.get_annuity()
         interest = self.loan.get_monthly_rate()
@@ -218,12 +258,14 @@ class MonthlyCost:
         Returns
         -------
         np.ndarray
-            Interest payment for each month in the payment schedule 
-            in NOK.
+            Interest payment for each month in the payment schedule
+            in NOK. Month k pays interest on the balance after payment
+            k - 1, and month 0 has no payment.
         """
         balance = self._get_outstanding_balance_schedule()
-        interest = self.loan.get_monthly_rate()
-        return balance * interest
+        interest = np.zeros_like(balance)
+        interest[1:] = balance[:-1] * self.loan.get_monthly_rate()
+        return interest
 
     def _get_customer_dividend(self) -> np.ndarray:
         """Calculate the projected customer dividend schedule.
@@ -231,11 +273,18 @@ class MonthlyCost:
         Returns
         -------
         np.ndarray
-            Customer dividend for each month in the payment schedule 
-            in NOK.
+            Customer dividend for each month in the payment schedule
+            in NOK. Like interest, month k is based on the balance after
+            payment k - 1, and month 0 has no payment.
         """
         balance = self._get_outstanding_balance_schedule()
-        return self.customer_dividend.get_dividend(balance)
+        dividend = np.zeros_like(balance)
+
+        if not self.include_dividend:
+            return dividend
+
+        dividend[1:] = self.customer_dividend.get_dividend(balance[:-1])
+        return dividend
 
     def _get_tax_deduction(self) -> np.ndarray:
         """Calculate the projected tax deduction schedule.
@@ -246,7 +295,11 @@ class MonthlyCost:
             Tax deduction for each month in the payment schedule in NOK.
         """
         interest = self.get_interest_schedule()
-        return interest * DEDUCTION_RATE
+
+        if not self.include_deduction:
+            return np.zeros_like(interest)
+
+        return interest * self.deduction_rate
 
     def get_monthly_cost(self) -> np.ndarray:
         """Calculate the projected monthly cost schedule.
@@ -255,6 +308,7 @@ class MonthlyCost:
         -------
         np.ndarray
             Monthly cost for each month in the payment schedule in NOK.
+            Month 0 has no payment, so its cost is 0.
         """
         annuity = self.loan.get_annuity()
         deduction = self._get_tax_deduction()
@@ -263,4 +317,75 @@ class MonthlyCost:
             self.apartment.joint_expenses
             / self.customer_dividend.borrowers  # change to borrowers from Borrower object
         )
-        return annuity - deduction  # + joint expenses - dividend
+        monthly_cost = annuity - deduction - dividend  # + joint expenses
+        monthly_cost[0] = 0
+        return monthly_cost
+
+    def get_quantile_estimate(
+        self,
+        lower_rate=LOWER_QUANTILE_RATE,
+        upper_rate=UPPER_QUANTILE_RATE,
+    ) -> dict:
+        """Project the monthly cost at a lower and an upper quantile of
+        the projected nominal rate, alongside the baseline.
+
+        Parameters
+        ----------
+        lower_rate : float, optional
+            Lower quantile of the projected nominal rate expressed as a
+            decimal. Defaults to LOWER_QUANTILE_RATE in config.py.
+        upper_rate : float, optional
+            Upper quantile of the projected nominal rate expressed as a
+            decimal. Defaults to UPPER_QUANTILE_RATE in config.py.
+
+        Returns
+        -------
+        dict
+            Keys are 'lower', 'baseline' and 'upper'. Each value is the
+            monthly cost schedule as an np.ndarray, with the same loan
+            amount and length as the baseline loan.
+
+        Raises
+        ------
+        ValueError
+            Lower quantile rate cannot exceed the upper quantile rate.
+        """
+        if lower_rate > upper_rate:
+            raise ValueError(
+                'Lower quantile rate cannot exceed the upper quantile rate'
+            )
+
+        def cost_at(rate):
+            loan = Loan(
+                amount=self.loan.amount,
+                nominal_rate=rate,
+                years=self.loan.years,
+            )
+            expenses = copy.copy(self)
+            expenses.loan = loan
+            return expenses.get_monthly_cost()
+
+        return {
+            'lower': cost_at(lower_rate),
+            'baseline': self.get_monthly_cost(),
+            'upper': cost_at(upper_rate),
+        }
+
+    def get_schedules(self) -> dict:
+        """Collect every projected schedule in a single mapping.
+
+        Returns
+        -------
+        dict
+            Keys are 'balance', 'interest', 'dividend', 'deduction' and
+            'monthly_cost'. Each value is an np.ndarray covering month 0
+            through the last month of the payment schedule.
+        """
+        return {
+            'balance': self._get_outstanding_balance_schedule(),
+            'interest': self.get_interest_schedule(),
+            'dividend': self._get_customer_dividend(),
+            'deduction': self._get_tax_deduction(),
+            'monthly_cost': self.get_monthly_cost(),
+        }
+
